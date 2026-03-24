@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pipecat-ai[all]
+ollama
+faster-whisper          # For STT (good Hindi support)
+kokoro                  # Or use remsky/Kokoro-FastAPI if you prefer separate server
+numpy
