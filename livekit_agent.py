@@ -1,147 +1,191 @@
-import os
 import asyncio
 import logging
+import os
+
 from dotenv import load_dotenv
 from livekit import rtc
-from livekit.agents import (
-    Agent,
-    AgentServer,
-    AgentSession,
-    ChatContext,
-    JobContext,
-    WorkerOptions,
-    cli,
-    room_io,
-    tts,
-)
-from livekit.plugins import google, silero, noise_cancellation
-from kokoro import KPipeline
-from faster_whisper import WhisperModel
-import numpy as np
-import torch
-from livekit.agents import stt, utils
+from livekit.agents import Agent, AgentSession, JobContext, JobProcess, WorkerOptions, cli, llm, room_io
+from livekit.agents.utils import wait_for_participant, wait_for_track_publication
+from livekit.plugins import deepgram, google, noise_cancellation, openai, silero
+
+try:
+    from livekit.plugins import cartesia
+except ImportError:
+    cartesia = None
 
 load_dotenv()
 
-logger = logging.getLogger("ai-agent")
+logger = logging.getLogger("telephony-agent")
+logger.setLevel(logging.INFO)
 
-# --- Local Whisper STT Implementation ---
-class WhisperSTT(stt.STT):
-    def __init__(self, model_size: str = "tiny"):
-        super().__init__(
-            capabilities=stt.STTCapabilities(streaming=False, interim_results=False)
-        )
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Using tiny model for speed and low memory
-        self._model = WhisperModel(model_size, device=device, compute_type="int8")
 
-    async def _recognize_impl(
-        self,
-        buffer: utils.AudioBuffer,
-        *,
-        language: stt.NotGivenOr[str] = stt.NOT_GIVEN,
-        conn_options: stt.APIConnectOptions,
-    ) -> stt.SpeechEvent:
-        # Combine frames into a single buffer
-        frame = rtc.combine_audio_frames(buffer)
-        # Convert int16 to float32 as expected by faster-whisper
-        audio_data = np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) / 32768.0
-        
-        # Run transcription in a thread to avoid blocking the event loop
-        loop = asyncio.get_event_loop()
-        segments, _ = await loop.run_in_executor(
-            None, lambda: self._model.transcribe(audio_data, beam_size=5)
-        )
-        
-        text = "".join([s.text for s in segments]).strip()
-        
-        return stt.SpeechEvent(
-            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[stt.SpeechData(text=text, language=language or "en", confidence=1.0)],
+def _has_google_cloud_credentials() -> bool:
+    credentials_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("GOOGLE_CLOUD_CREDENTIALS_FILE")
+    return bool(credentials_file and os.path.exists(credentials_file))
+
+
+def _build_llm() -> llm.LLM:
+    providers: list[llm.LLM] = []
+    preferred = os.getenv("PRIMARY_LLM_PROVIDER", "google").strip().lower()
+
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+
+    if google_api_key:
+        providers.append(
+            google.LLM(
+                model=os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.5-flash"),
+                api_key=google_api_key,
+            )
         )
 
-# Custom TTS for Kokoro to work with LiveKit's inference engine
-class KokoroTTS(tts.TTS):
-    def __init__(self, voice: str = "af_heart", lang_code: str = "a"):
-        super().__init__(
-            streaming_supported=True,
-            sample_rate=24000,
-            num_channels=1,
+    if openai_api_key:
+        providers.append(
+            openai.LLM(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                api_key=openai_api_key,
+            )
         )
-        self._pipeline = KPipeline(lang_code=lang_code)
-        self._voice = voice
 
-    def synthesize(self, text: str) -> tts.SynthesizeStream:
-        return KokoroStream(self, text)
+    if not providers:
+        raise RuntimeError(
+            "No LLM provider is configured. Set GOOGLE_API_KEY and/or OPENAI_API_KEY."
+        )
 
-class KokoroStream(tts.SynthesizeStream):
-    def __init__(self, tts: KokoroTTS, text: str):
-        super().__init__(tts, text)
-        self._text = text
-        self._tts = tts
+    providers.sort(key=lambda provider: 0 if provider.label.startswith(f"livekit.plugins.{preferred}") else 1)
 
-    async def _run(self):
-        generator = self._tts._pipeline(self._text, voice=self._tts._voice, speed=1.0)
-        for _, _, audio in generator:
-            if audio is not None:
-                audio_int16 = (audio * 32767).astype(np.int16)
-                self._push_audio(
-                    rtc.AudioFrame(
-                        data=audio_int16.tobytes(),
-                        sample_rate=self._tts.sample_rate,
-                        num_channels=self._tts.num_channels,
-                        samples_per_channel=len(audio_int16)
-                    )
-                )
-        self._mark_done()
+    provider_names = [provider.label for provider in providers]
+    logger.info("using LLM fallback chain: %s", " -> ".join(provider_names))
 
-class DefaultAgent(Agent):
+    if len(providers) == 1:
+        return providers[0]
+
+    return llm.FallbackAdapter(
+        llm=providers,
+        attempt_timeout=float(os.getenv("LLM_ATTEMPT_TIMEOUT", "8")),
+        max_retry_per_llm=0,
+        retry_interval=float(os.getenv("LLM_RETRY_INTERVAL", "0.5")),
+        retry_on_chunk_sent=False,
+    )
+
+
+def prewarm(proc: JobProcess) -> None:
+    """Load VAD once per worker process to keep call startup fast."""
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+class TelephonyAssistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="""You are a polite, professional, and friendly AI voice agent for [YOUR BUSINESS NAME] in India.
-Speak naturally in Hindi or English (Hinglish is fine).
-Be helpful and keep the conversation flowing for up to 10 minutes.
-If the user wants to speak to a human, say "Transferring you to our team member" and end politely.
-"""
+            instructions="""
+You are a helpful, friendly, and professional AI phone assistant.
+Speak naturally, clearly, and concisely.
+Keep responses short and phone-friendly.
+Use a warm, polite tone and guide the caller efficiently.
+If the caller asks for a human agent, say you will transfer them and end politely.
+""".strip()
         )
 
-    async def on_enter(self):
-        await self.session.generate_reply(
-            instructions="""Greet the user in Hindi/English (Hinglish). Example: "नमस्ते! मैं आपकी क्या मदद कर सकता हूँ?" """,
-            allow_interruptions=True,
+
+async def _wait_for_call_participant(room: rtc.Room) -> rtc.RemoteParticipant:
+    participant = await wait_for_participant(room)
+
+    try:
+        await wait_for_track_publication(
+            room,
+            identity=participant.identity,
+            kind=rtc.TrackKind.KIND_AUDIO,
         )
+    except Exception:
+        logger.exception("failed while waiting for participant audio track")
 
-async def entrypoint(ctx: JobContext):
-    logger.info(f"🚀 AI Agent starting in room: {ctx.room.name}")
+    if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+        for _ in range(40):
+            call_status = participant.attributes.get("sip.callStatus", "").lower()
+            if call_status not in {"", "dialing", "ringing"}:
+                break
+            await asyncio.sleep(0.5)
 
-    # 1. Initialize Services
-    # Using Google Gemini as the LLM
-    llm_service = google.LLM(
-        model="gemini-2.5-flash",
+        await asyncio.sleep(0.5)
+
+    return participant
+
+
+def _build_stt(is_phone_call: bool):
+    if os.getenv("DEEPGRAM_API_KEY"):
+        model = "nova-2-phonecall" if is_phone_call else "nova-2-general"
+        logger.info("using Deepgram STT with model %s", model)
+        return deepgram.STT(model=model)
+
+    if _has_google_cloud_credentials():
+        logger.info("using Google Cloud STT")
+        return google.STT()
+
+    raise RuntimeError(
+        "No telephony STT provider is configured. Set DEEPGRAM_API_KEY or GOOGLE_APPLICATION_CREDENTIALS. GOOGLE_API_KEY alone cannot be used for Google STT."
     )
 
-    # Using Local Whisper for Speech-to-Text (No API key needed)
-    stt_service = WhisperSTT(model_size="tiny")
 
-    tts_service = KokoroTTS(voice="af_heart")
+def _build_tts():
+    cartesia_api_key = os.getenv("CARTESIA_API_KEY")
+    cartesia_voice_id = os.getenv("CARTESIA_VOICE_ID")
+    if cartesia and cartesia_api_key and cartesia_voice_id:
+        logger.info("using Cartesia TTS voice %s", cartesia_voice_id)
+        return cartesia.TTS(voice=cartesia_voice_id)
 
-    # 2. Setup Session
-    session = AgentSession(
-        stt=stt_service,
-        llm=llm_service,
-        tts=tts_service,
-        vad=silero.VAD.load(),
+    if _has_google_cloud_credentials():
+        google_voice = os.getenv("GOOGLE_TTS_VOICE", "en-US-Neural2-F")
+        logger.info("using Google TTS voice %s", google_voice)
+        return google.TTS(voice_name=google_voice)
+
+    raise RuntimeError(
+        "No telephony TTS provider is configured. Set CARTESIA_API_KEY with CARTESIA_VOICE_ID, or configure GOOGLE_APPLICATION_CREDENTIALS for Google TTS."
     )
 
-    # 3. Define Room Options (for SIP noise cancellation)
+
+async def entrypoint(ctx: JobContext) -> None:
+    logger.info("new telephony job started - room=%s", ctx.room.name)
+
+    await ctx.connect()
+    participant = await _wait_for_call_participant(ctx.room)
+    is_phone_call = participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+
     room_options = room_io.RoomOptions(
         audio_input=room_io.AudioInputOptions(
-            noise_cancellation=lambda params: noise_cancellation.BVCTelephony() if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP else noise_cancellation.BVC(),
+            noise_cancellation=lambda params: (
+                noise_cancellation.BVCTelephony()
+                if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                else noise_cancellation.BVC()
+            ),
         ),
     )
 
-    # Start the session
-    await session.start(agent=DefaultAgent(), room=ctx.room, room_options=room_options)
+    session = AgentSession(
+        stt=_build_stt(is_phone_call=is_phone_call),
+        llm=_build_llm(),
+        tts=_build_tts(),
+        vad=ctx.proc.userdata.get("vad") or silero.VAD.load(),
+    )
+
+    await session.start(
+        room=ctx.room,
+        agent=TelephonyAssistant(),
+        room_options=room_options,
+    )
+
+    try:
+        await session.generate_reply(
+            instructions="Greet the caller warmly and ask how you can help them today.",
+            allow_interruptions=True,
+        )
+    except Exception:
+        logger.exception("failed to generate initial greeting")
+
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
+        )
+    )
