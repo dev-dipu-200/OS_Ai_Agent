@@ -19,9 +19,9 @@ def has_google_cloud_credentials() -> bool:
 
 
 def validate_telephony_provider_config() -> None:
-    if not (os.getenv("GOOGLE_API_KEY") or os.getenv("OPENAI_API_KEY")):
+    if not (os.getenv("GOOGLE_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY")):
         raise RuntimeError(
-            "No LLM provider is configured. Set GOOGLE_API_KEY and/or OPENAI_API_KEY."
+            "No LLM provider is configured. Set GOOGLE_API_KEY, OPENAI_API_KEY, and/or GROQ_API_KEY."
         )
 
     if os.getenv("DEEPGRAM_API_KEY") or has_google_cloud_credentials():

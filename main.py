@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from livekit import api
 from pydantic import BaseModel
+from call_analysis import fetch_latest_analysis, fetch_analysis_by_id, analysis_db_health
 from outbound_call import (
     make_outbound_call,
     start_agent_process,
@@ -90,6 +91,62 @@ async def livekit_webhook(request: Request):
     except Exception as exc:
         logger.exception("webhook handling failed")
         return {"status": "error", "message": str(exc)}
+
+
+@app.get("/call/analysis/latest")
+async def latest_call_analysis():
+    try:
+        result = await fetch_latest_analysis()
+        if result is None:
+            raise HTTPException(status_code=404, detail="No call analysis found")
+        return result
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/call/analysis/latest/summary")
+async def latest_call_analysis_summary():
+    try:
+        result = await fetch_latest_analysis()
+        if result is None:
+            raise HTTPException(status_code=404, detail="No call analysis found")
+        return {
+            "analysis_id": result.get("_analysis_id"),
+            "backend": result.get("_backend"),
+            "room_name": result.get("room_name"),
+            "participant_identity": result.get("participant_identity"),
+            "participant_kind": result.get("participant_kind"),
+            "started_at": result.get("started_at"),
+            "ended_at": result.get("ended_at"),
+            "duration_seconds": result.get("duration_seconds"),
+            "close_reason": result.get("close_reason"),
+            "overall_match_score": result.get("overall_match_score"),
+            "total_pairs": result.get("total_pairs"),
+            "answered_pairs": result.get("answered_pairs"),
+            "unanswered_pairs": result.get("unanswered_pairs"),
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/call/analysis/{analysis_id}")
+async def call_analysis_by_id(analysis_id: int):
+    try:
+        result = await fetch_analysis_by_id(analysis_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Call analysis not found")
+        return result
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/call/analysis/health")
+async def analysis_health():
+    try:
+        status = await analysis_db_health()
+        return status
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/call/outbound")

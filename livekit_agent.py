@@ -1,17 +1,26 @@
 import asyncio
 import logging
 import os
+from typing import Any
 
 from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import Agent, AgentSession, JobContext, JobProcess, WorkerOptions, cli, llm, room_io
 from livekit.agents.utils import wait_for_participant, wait_for_track_publication
+from livekit.agents.stt import (
+    RecognitionUsage,
+    SpeechData,
+    SpeechEvent,
+    SpeechEventType,
+    STT,
+    STTCapabilities,
+)
+from livekit.agents.types import NOT_GIVEN
+from livekit.agents.utils.audio import calculate_audio_duration
+from faster_whisper import WhisperModel
+import numpy as np
+from scipy.signal import resample
 from livekit.plugins import deepgram, google, noise_cancellation, openai, silero
-
-try:
-    from livekit.plugins import cartesia
-except ImportError:
-    cartesia = None
 
 load_dotenv()
 
