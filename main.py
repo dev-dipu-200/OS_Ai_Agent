@@ -129,6 +129,15 @@ async def latest_call_analysis_summary():
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/call/analysis/health")
+async def analysis_health():
+    try:
+        status = await analysis_db_health()
+        return status
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/call/analysis/{analysis_id}")
 async def call_analysis_by_id(analysis_id: int):
     try:
@@ -136,15 +145,6 @@ async def call_analysis_by_id(analysis_id: int):
         if result is None:
             raise HTTPException(status_code=404, detail="Call analysis not found")
         return result
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.get("/call/analysis/health")
-async def analysis_health():
-    try:
-        status = await analysis_db_health()
-        return status
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
