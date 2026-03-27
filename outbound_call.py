@@ -18,6 +18,10 @@ def has_google_cloud_credentials() -> bool:
     return bool(credentials_file and os.path.exists(credentials_file))
 
 
+def has_cartesia_credentials() -> bool:
+    return bool(os.getenv("CARTESIA_API_KEY") and os.getenv("CARTESIA_VOICE_ID"))
+
+
 def validate_telephony_provider_config() -> None:
     if not (os.getenv("GOOGLE_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY")):
         raise RuntimeError(
@@ -25,7 +29,11 @@ def validate_telephony_provider_config() -> None:
         )
 
     if os.getenv("DEEPGRAM_API_KEY") or has_google_cloud_credentials():
-        return
+        if has_cartesia_credentials() or has_google_cloud_credentials():
+            return
+        raise RuntimeError(
+            "Telephony TTS is not configured. Set CARTESIA_API_KEY with CARTESIA_VOICE_ID, or configure Google Cloud credentials via GOOGLE_APPLICATION_CREDENTIALS."
+        )
 
     raise RuntimeError(
         "Telephony STT is not configured. Set DEEPGRAM_API_KEY, or configure Google Cloud credentials via GOOGLE_APPLICATION_CREDENTIALS. GOOGLE_API_KEY alone is only enough for Gemini LLM."
@@ -67,13 +75,13 @@ async def make_outbound_call(phone_number: str):
     1. Starts the AI Agent in a new room.
     2. Uses LiveKit SIP API to dial the phone number via Vobiz.
     """
-    room_name = f"outbound_{phone_number.replace('+', '').replace(' ', '')}"
-    start_agent_process(room_name)
-
+    validate_telephony_provider_config()
     sip_trunk_id = os.getenv("VOBIZ_SIP_TRUNK_ID")
     if not sip_trunk_id:
-        logger.error("VOBIZ_SIP_TRUNK_ID is not set in .env")
-        return
+        raise RuntimeError("VOBIZ_SIP_TRUNK_ID is not set in .env")
+
+    room_name = f"outbound_{phone_number.replace('+', '').replace(' ', '')}"
+    start_agent_process(room_name)
 
     lkapi = api.LiveKitAPI(
         url=os.getenv("LIVEKIT_URL"),
@@ -83,14 +91,18 @@ async def make_outbound_call(phone_number: str):
 
     logger.info("dialing %s via Vobiz", phone_number)
     try:
-        await lkapi.sip.create_sip_participant(
+        sip_participant = await lkapi.sip.create_sip_participant(
             api.CreateSIPParticipantRequest(
                 sip_trunk_id=sip_trunk_id,
                 sip_call_to=phone_number,
                 room_name=room_name,
             )
         )
-        logger.info("SIP call request sent successfully")
+        logger.info(
+            "SIP call request sent successfully participant=%s room=%s",
+            getattr(sip_participant, "participant_identity", None),
+            room_name,
+        )
     except Exception:
         logger.exception("failed to initiate outbound SIP call")
         raise

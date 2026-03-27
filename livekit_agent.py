@@ -1,26 +1,12 @@
 import asyncio
 import logging
 import os
-from typing import Any
 
 from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import Agent, AgentSession, JobContext, JobProcess, WorkerOptions, cli, llm, room_io
 from livekit.agents.utils import wait_for_participant, wait_for_track_publication
-from livekit.agents.stt import (
-    RecognitionUsage,
-    SpeechData,
-    SpeechEvent,
-    SpeechEventType,
-    STT,
-    STTCapabilities,
-)
-from livekit.agents.types import NOT_GIVEN
-from livekit.agents.utils.audio import calculate_audio_duration
-from faster_whisper import WhisperModel
-import numpy as np
-from scipy.signal import resample
-from livekit.plugins import deepgram, google, noise_cancellation, openai, silero
+from livekit.plugins import cartesia, deepgram, google, noise_cancellation, openai, silero
 
 load_dotenv()
 
@@ -31,6 +17,10 @@ logger.setLevel(logging.INFO)
 def _has_google_cloud_credentials() -> bool:
     credentials_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("GOOGLE_CLOUD_CREDENTIALS_FILE")
     return bool(credentials_file and os.path.exists(credentials_file))
+
+
+def _has_cartesia_credentials() -> bool:
+    return bool(os.getenv("CARTESIA_API_KEY") and os.getenv("CARTESIA_VOICE_ID"))
 
 
 def _build_llm() -> llm.LLM:
@@ -98,6 +88,12 @@ If the caller asks for a human agent, say you will transfer them and end politel
 
 async def _wait_for_call_participant(room: rtc.Room) -> rtc.RemoteParticipant:
     participant = await wait_for_participant(room)
+    logger.info(
+        "participant joined room=%s identity=%s kind=%s",
+        room.name,
+        participant.identity,
+        participant.kind,
+    )
 
     try:
         await wait_for_track_publication(
@@ -105,12 +101,20 @@ async def _wait_for_call_participant(room: rtc.Room) -> rtc.RemoteParticipant:
             identity=participant.identity,
             kind=rtc.TrackKind.KIND_AUDIO,
         )
+        logger.info("audio track published for participant=%s", participant.identity)
     except Exception:
         logger.exception("failed while waiting for participant audio track")
 
     if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
         for _ in range(40):
             call_status = participant.attributes.get("sip.callStatus", "").lower()
+            disconnect_reason = participant.disconnect_reason
+            logger.info(
+                "SIP participant status identity=%s call_status=%s disconnect_reason=%s",
+                participant.identity,
+                call_status or "<empty>",
+                disconnect_reason,
+            )
             if call_status not in {"", "dialing", "ringing"}:
                 break
             await asyncio.sleep(0.5)
@@ -138,7 +142,7 @@ def _build_stt(is_phone_call: bool):
 def _build_tts():
     cartesia_api_key = os.getenv("CARTESIA_API_KEY")
     cartesia_voice_id = os.getenv("CARTESIA_VOICE_ID")
-    if cartesia and cartesia_api_key and cartesia_voice_id:
+    if cartesia_api_key and cartesia_voice_id:
         logger.info("using Cartesia TTS voice %s", cartesia_voice_id)
         return cartesia.TTS(voice=cartesia_voice_id)
 
@@ -154,6 +158,15 @@ def _build_tts():
 
 async def entrypoint(ctx: JobContext) -> None:
     logger.info("new telephony job started - room=%s", ctx.room.name)
+
+    if not (os.getenv("DEEPGRAM_API_KEY") or _has_google_cloud_credentials()):
+        raise RuntimeError(
+            "No telephony STT provider is configured. Set DEEPGRAM_API_KEY or GOOGLE_APPLICATION_CREDENTIALS."
+        )
+    if not (_has_cartesia_credentials() or _has_google_cloud_credentials()):
+        raise RuntimeError(
+            "No telephony TTS provider is configured. Set CARTESIA_API_KEY with CARTESIA_VOICE_ID, or GOOGLE_APPLICATION_CREDENTIALS."
+        )
 
     await ctx.connect()
     participant = await _wait_for_call_participant(ctx.room)
